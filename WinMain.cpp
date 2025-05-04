@@ -11,11 +11,43 @@
 
 using namespace DirectX;
 
-// Vertex structure
-struct Vertex {
-    XMFLOAT3 position;
-    XMFLOAT4 color;
+struct ConstantBuffer
+{
+    XMMATRIX mWorldViewProj; // Combine World * View * Projection
 };
+
+// Cube vertices (position and color) from Microsoft example:contentReference[oaicite:2]{index=2}:
+struct Vertex { XMFLOAT3 pos; XMFLOAT3 color; };
+Vertex CubeVertices[] = {
+    { XMFLOAT3(-0.5f,-0.5f,-0.5f), {0,0,0} },
+    { XMFLOAT3(-0.5f,-0.5f, 0.5f), {0,0,1} },
+    { XMFLOAT3(-0.5f, 0.5f,-0.5f), {0,1,0} },
+    { XMFLOAT3(-0.5f, 0.5f, 0.5f), {0,1,1} },
+    { XMFLOAT3(0.5f,-0.5f,-0.5f), {1,0,0} },
+    { XMFLOAT3(0.5f,-0.5f, 0.5f), {1,0,1} },
+    { XMFLOAT3(0.5f, 0.5f,-0.5f), {1,1,0} },
+    { XMFLOAT3(0.5f, 0.5f, 0.5f), {1,1,1} },
+};
+unsigned short CubeIndices[] = {
+    0,2,1,  1,2,3,   // -X face
+    4,5,6,  5,7,6,   // +X face
+    0,1,5,  0,5,4,   // -Y (bottom)
+    2,6,7,  2,7,3,   // +Y (top)
+    0,4,6,  0,6,2,   // -Z face
+    1,3,7,  1,7,5    // +Z face
+};
+//// Pyramid vertices (4 base corners + apex):contentReference[oaicite:3]{index=3}:
+//Vertex PyramidVertices[] = {
+//    { XMFLOAT3(+1.0f,0.0f,+1.0f), {0,1,0} },
+//    { XMFLOAT3(+1.0f,0.0f,-1.0f), {0,1,0} },
+//    { XMFLOAT3(-1.0f,0.0f,-1.0f), {0,1,0} },
+//    { XMFLOAT3(-1.0f,0.0f,+1.0f), {0,1,0} },
+//    { XMFLOAT3(0.0f,1.5f, 0.0f), {0,0,1} },  // apex
+//};
+//unsigned short PyramidIndices[] = {
+//    0,1,4,  1,2,4,  2,3,4,  3,0,4, // 4 triangular sides
+//    0,3,2,  0,2,1  // base (two triangles)
+//};
 
 // Global Declarations
 HWND g_hWnd = nullptr;
@@ -23,8 +55,12 @@ ID3D11Device* g_pd3dDevice = nullptr;
 ID3D11DeviceContext* g_pImmediateContext = nullptr;
 IDXGISwapChain* g_pSwapChain = nullptr;
 ID3D11RenderTargetView* g_pRenderTargetView = nullptr;
+ID3D11DepthStencilView* g_pDepthStencilView = nullptr;
+ID3D11Texture2D* g_pDepthStencilBuffer = nullptr;
 ID3D11InputLayout* g_pInputLayout = nullptr;
 ID3D11Buffer* g_pVertexBuffer = nullptr;
+ID3D11Buffer* g_pIndexBuffer = nullptr;
+ID3D11Buffer* g_pConstantBuffer = nullptr;
 ID3D11VertexShader* g_pVertexShader = nullptr;
 ID3D11PixelShader* g_pPixelShader = nullptr;
 
@@ -118,6 +154,32 @@ HRESULT InitDevice() {
 
     g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, nullptr);
 
+    // create depth stencil buffer
+    D3D11_TEXTURE2D_DESC depthDesc = {};
+    depthDesc.Width = sd.BufferDesc.Width;
+    depthDesc.Height = sd.BufferDesc.Height;
+    depthDesc.MipLevels = 1;
+    depthDesc.ArraySize = 1;
+    depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; // 24-bit depth + 8-bit stencil
+    depthDesc.SampleDesc.Count = 1; // No MSAA for now
+    depthDesc.SampleDesc.Quality = 0;
+    depthDesc.Usage = D3D11_USAGE_DEFAULT;
+    depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    depthDesc.CPUAccessFlags = 0;
+    depthDesc.MiscFlags = 0;
+
+    hr = g_pd3dDevice->CreateTexture2D(&depthDesc, nullptr, &g_pDepthStencilBuffer);
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    hr = g_pd3dDevice->CreateDepthStencilView(g_pDepthStencilBuffer, nullptr, &g_pDepthStencilView);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    g_pImmediateContext->OMSetRenderTargets(1, &g_pRenderTargetView, g_pDepthStencilView);
+
+
     // Setup viewport
     D3D11_VIEWPORT vp = {};
     vp.Width = 800.0f;
@@ -132,11 +194,12 @@ HRESULT InitDevice() {
     ID3DBlob* errorBlob = nullptr;
 
     const char* vsCode =
+        "cbuffer ConstantBuffer : register(b0) { matrix mWorldViewProj; };"
         "struct VS_INPUT { float3 pos : POSITION; float4 col : COLOR; };"
         "struct PS_INPUT { float4 pos : SV_POSITION; float4 col : COLOR; };"
         "PS_INPUT VSMain(VS_INPUT input) {"
         "    PS_INPUT output;"
-        "    output.pos = float4(input.pos, 1.0);"
+        "    output.pos = mul(float4(input.pos, 1.0f), mWorldViewProj);"
         "    output.col = input.col;"
         "    return output;"
         "}";
@@ -198,23 +261,32 @@ HRESULT InitDevice() {
     g_pImmediateContext->IASetInputLayout(g_pInputLayout);
 
     // Create vertex buffer
-    Vertex vertices[] = {
-        { XMFLOAT3(0.0f, 0.5f, 0.0f), XMFLOAT4(1.f, 0.f, 0.f, 1.f) },
-        { XMFLOAT3(0.5f, -0.5f, 0.0f), XMFLOAT4(0.f, 1.f, 0.f, 1.f) },
-        { XMFLOAT3(-0.5f, -0.5f, 0.0f), XMFLOAT4(0.f, 0.f, 1.f, 1.f) },
-    };
+    // Example (cube) – similar for pyramid:
+    D3D11_BUFFER_DESC vDesc = { sizeof(CubeVertices), D3D11_USAGE_DEFAULT,
+        D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA vData = { CubeVertices, 0, 0 };
+    hr = g_pd3dDevice->CreateBuffer(&vDesc, &vData, &g_pVertexBuffer);
+    if (FAILED(hr))
+        return hr;
+
+    D3D11_BUFFER_DESC iDesc = { sizeof(CubeIndices), D3D11_USAGE_DEFAULT,
+        D3D11_BIND_INDEX_BUFFER, 0, 0, 0 };
+    D3D11_SUBRESOURCE_DATA iData = { CubeIndices, 0, 0 };
+    hr = g_pd3dDevice->CreateBuffer(&iDesc, &iData, &g_pIndexBuffer);
+    if (FAILED(hr)) {
+        MessageBoxA(0, "Failed to create index buffer", "Error", MB_ICONERROR);
+    }
 
     D3D11_BUFFER_DESC bd = {};
     bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.ByteWidth = sizeof(vertices);
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.ByteWidth = sizeof(ConstantBuffer);
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = 0;
 
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = vertices;
-
-    hr = g_pd3dDevice->CreateBuffer(&bd, &initData, &g_pVertexBuffer);
-    if (FAILED(hr))
-        return hr;
+    hr = g_pd3dDevice->CreateBuffer(&bd, nullptr, &g_pConstantBuffer);
+    if (FAILED(hr)) {
+        MessageBoxA(0, "Failed to create constant buffer", "Error", MB_ICONERROR);
+    }
 
     return S_OK;
 }
@@ -224,11 +296,16 @@ void Render() {
     // Clear the back buffer
     float clearColor[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
     g_pImmediateContext->ClearRenderTargetView(g_pRenderTargetView, clearColor);
+    g_pImmediateContext->ClearDepthStencilView(g_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
+
 
     // Set vertex buffer
     UINT stride = sizeof(Vertex);
     UINT offset = 0;
     g_pImmediateContext->IASetVertexBuffers(0, 1, &g_pVertexBuffer, &stride, &offset);
+
+    // Set index buffer
+    g_pImmediateContext->IASetIndexBuffer(g_pIndexBuffer, DXGI_FORMAT_R16_UINT, 0);
 
     // Set primitive topology
     g_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -237,8 +314,27 @@ void Render() {
     g_pImmediateContext->VSSetShader(g_pVertexShader, nullptr, 0);
     g_pImmediateContext->PSSetShader(g_pPixelShader, nullptr, 0);
 
-    // Draw triangle
-    g_pImmediateContext->Draw(3, 0);
+    // Set constant buffer (for MVP matrix, etc.)
+    g_pImmediateContext->VSSetConstantBuffers(0, 1, &g_pConstantBuffer);
+
+    //Initialize and set the world-view-projection matrix
+    XMMATRIX world = XMMatrixRotationY(0.0f); // static cube, or animate over time
+    XMMATRIX view = XMMatrixLookAtLH(
+        XMVectorSet(0.0f, 1.5f, -3.0f, 0.0f),  // camera position
+        XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f),   // look at origin
+        XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));  // up vector
+
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, 800.0f / 600.0f, 0.1f, 100.0f);
+
+    XMMATRIX wvp = world * view * proj;
+
+    ConstantBuffer cb;
+    cb.mWorldViewProj = XMMatrixTranspose(wvp); // Transpose for HLSL
+
+    g_pImmediateContext->UpdateSubresource(g_pConstantBuffer, 0, nullptr, &cb, 0, 0);
+
+    // Draw indexed geometry
+    g_pImmediateContext->DrawIndexed(_countof(CubeIndices), 0, 0);
 
     // Present the buffer to the screen
     g_pSwapChain->Present(1, 0);
